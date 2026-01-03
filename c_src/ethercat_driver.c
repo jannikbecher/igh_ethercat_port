@@ -122,25 +122,25 @@ static int enqueue_message(driver_state_t *state, message_queue_entry_t *msg) {
     unsigned int head = atomic_load(&state->msg_head);
     unsigned int tail = atomic_load(&state->msg_tail);
     unsigned int next_head = (head + 1) % MESSAGE_QUEUE_SIZE;
-    
+
     // Check if queue is full
     if (next_head == tail) {
         return -1;  // Queue full, drop message
     }
-    
+
     // Copy message to queue
     memcpy(&state->message_queue[head], msg, sizeof(message_queue_entry_t));
-    
+
     // Update head
     atomic_store(&state->msg_head, next_head);
-    
+
     return 0;
 }
 
 static void signal_driver_thread(driver_state_t *state) {
     // Increment pending message counter
     atomic_fetch_add(&state->pending_messages, 1);
-    
+
     // Write a byte to the pipe to wake up the driver thread
     char byte = 1;
     ssize_t written = write(state->pipe_fd[1], &byte, 1);
@@ -205,7 +205,7 @@ static void send_output_confirmed(driver_state_t *state, pending_write_t *write)
 static void send_cycle_stats(driver_state_t *state) {
     int64_t avg = state->cycle_count > 0 ?
                   state->sum_latency_ns / (int64_t)state->cycle_count : 0;
-    
+
     message_queue_entry_t msg = {
         .type = MSG_TYPE_CYCLE_STATS,
         .data.cycle_stats.cycle_count = state->cycle_count,
@@ -404,7 +404,7 @@ static void* cyclic_task(void *arg) {
             state->overrun_count += (expirations - 1);
         }
 
-        int64_t latency = (int64_t)(now - (expected_time - state->cycle_time_ns));
+        int64_t latency = (int64_t)(now - expected_time);
         if (latency < state->min_latency_ns) state->min_latency_ns = latency;
         if (latency > state->max_latency_ns) state->max_latency_ns = latency;
         state->sum_latency_ns += (latency > 0) ? latency : -latency;
@@ -451,6 +451,7 @@ static void* cyclic_task(void *arg) {
             state->min_latency_ns = INT64_MAX;
             state->max_latency_ns = 0;
             state->sum_latency_ns = 0;
+            state->cycle_count = 0;
         }
     }
 
@@ -471,7 +472,7 @@ static ErlDrvData start(ErlDrvPort port, char *command) {
     state->port_term = driver_mk_port(port);  // Store for thread-safe messaging
     state->cycle_time_ns = 1000000;  // 1ms default
     state->next_request_id = 1;
-    
+
     // Pre-create atoms (driver_mk_atom is not thread-safe, so do it here)
     state->atom_ecat_pdo = driver_mk_atom("ecat_pdo");
     state->atom_ecat_link = driver_mk_atom("ecat_link");
@@ -489,17 +490,17 @@ static ErlDrvData start(ErlDrvPort port, char *command) {
     atomic_store(&state->pending_messages, 0);
     atomic_store(&state->msg_head, 0);
     atomic_store(&state->msg_tail, 0);
-    
+
     // Create pipe for thread-safe signaling
     if (pipe(state->pipe_fd) < 0) {
         driver_free(state);
         return ERL_DRV_ERROR_GENERAL;
     }
-    
+
     // Set pipe to non-blocking mode
     int flags = fcntl(state->pipe_fd[0], F_GETFL, 0);
     fcntl(state->pipe_fd[0], F_SETFL, flags | O_NONBLOCK);
-    
+
     // Register pipe read end with driver_select
     driver_select(port, (ErlDrvEvent)(long)state->pipe_fd[0], ERL_DRV_READ, 1);
 
@@ -511,21 +512,21 @@ static ErlDrvData start(ErlDrvPort port, char *command) {
 static void ready_input(ErlDrvData drv_data, ErlDrvEvent event) {
     driver_state_t *state = (driver_state_t *)drv_data;
     (void)event;
-    
+
     // Drain the pipe
     char buf[64];
     while (read(state->pipe_fd[0], buf, sizeof(buf)) > 0);
-    
+
     // Reset pending messages counter
     atomic_store(&state->pending_messages, 0);
-    
+
     // Process all queued messages
     unsigned int tail = atomic_load(&state->msg_tail);
     unsigned int head = atomic_load(&state->msg_head);
-    
+
     while (tail != head) {
         message_queue_entry_t *msg = &state->message_queue[tail];
-        
+
         switch (msg->type) {
             case MSG_TYPE_PDO_CHANGED: {
                 ErlDrvTermData spec[] = {
@@ -538,31 +539,31 @@ static void ready_input(ErlDrvData drv_data, ErlDrvEvent event) {
                 erl_drv_output_term(state->port_term, spec, sizeof(spec)/sizeof(spec[0]));
                 break;
             }
-            
+
             case MSG_TYPE_LINK_STATE: {
                 ErlDrvTermData spec[] = {
                     ERL_DRV_ATOM, state->atom_ecat_link,
-                    ERL_DRV_ATOM, msg->data.link_state.link_up ? 
+                    ERL_DRV_ATOM, msg->data.link_state.link_up ?
                                   state->atom_up : state->atom_down,
                     ERL_DRV_TUPLE, 2
                 };
                 erl_drv_output_term(state->port_term, spec, sizeof(spec)/sizeof(spec[0]));
                 break;
             }
-            
+
             case MSG_TYPE_MASTER_STATE: {
                 ErlDrvTermData spec[] = {
                     ERL_DRV_ATOM, state->atom_ecat_master_state,
                     ERL_DRV_UINT, msg->data.master_state.slaves_responding,
                     ERL_DRV_UINT, msg->data.master_state.al_states,
-                    ERL_DRV_ATOM, msg->data.master_state.link_up ? 
+                    ERL_DRV_ATOM, msg->data.master_state.link_up ?
                                   state->atom_true : state->atom_false,
                     ERL_DRV_TUPLE, 4
                 };
                 erl_drv_output_term(state->port_term, spec, sizeof(spec)/sizeof(spec[0]));
                 break;
             }
-            
+
             case MSG_TYPE_CYCLE_STATS: {
                 ErlDrvTermData spec[] = {
                     ERL_DRV_ATOM, state->atom_ecat_stats,
@@ -576,7 +577,7 @@ static void ready_input(ErlDrvData drv_data, ErlDrvEvent event) {
                 erl_drv_output_term(state->port_term, spec, sizeof(spec)/sizeof(spec[0]));
                 break;
             }
-            
+
             case MSG_TYPE_OUTPUT_CONFIRMED: {
                 ErlDrvTermData spec[] = {
                     ERL_DRV_ATOM, driver_mk_atom("ecat_output_confirmed"),
@@ -587,10 +588,10 @@ static void ready_input(ErlDrvData drv_data, ErlDrvEvent event) {
                 break;
             }
         }
-        
+
         tail = (tail + 1) % MESSAGE_QUEUE_SIZE;
     }
-    
+
     // Update tail
     atomic_store(&state->msg_tail, tail);
 }
@@ -617,7 +618,7 @@ static void stop(ErlDrvData drv_data) {
         state->master = NULL;
         state->domain = NULL;
     }
-    
+
     // Close pipe
     if (state->pipe_fd[0] >= 0) {
         driver_select(state->port, (ErlDrvEvent)(long)state->pipe_fd[0], ERL_DRV_READ, 0);
@@ -706,13 +707,13 @@ static ErlDrvSSizeT control(ErlDrvData drv_data, unsigned int command,
                 result = -1;
                 break;
             }
-            
+
             // Check that domain has at least some PDO entries registered
             if (state->num_pdo_entries == 0) {
                 result = -4;  // No PDOs registered
                 break;
             }
-            
+
             int ret = ecrt_master_activate(state->master);
             if (ret < 0) {
                 result = ret;
@@ -806,16 +807,16 @@ static ErlDrvSSizeT control(ErlDrvData drv_data, unsigned int command,
                 result = -1;
                 break;
             }
-            
+
             uint16_t slave_position;
             memcpy(&slave_position, buf, 2);
-            
+
             ec_slave_info_t slave_info;
             if (ecrt_master_get_slave(state->master, slave_position, &slave_info) < 0) {
                 result = -2;
                 break;
             }
-            
+
             // Return: vendor_id(4) + product_code(4) + revision_no(4) + serial_no(4) = 16 bytes
             if (rlen < 16) *rbuf = driver_alloc(16);
             memcpy(*rbuf, &slave_info.vendor_id, 4);

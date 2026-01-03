@@ -168,7 +168,7 @@ defmodule EtherCAT.Master do
     port = Port.open({:spawn_driver, ~c"ethercat_driver"}, [:binary])
 
     # Extract configuration options
-    cycle_time_us = Keyword.get(opts, :cycle_time_us, 10_000)
+    cycle_time_us = Keyword.get(opts, :cycle_time_us, 1_000)
     max_recovery_attempts = Keyword.get(opts, :max_recovery_attempts, 3)
 
     # Set cycle time
@@ -688,12 +688,16 @@ defmodule EtherCAT.Master do
   end
 
   def operational(:info, {:ecat_stats, cycles, min_lat, max_lat, avg_lat, overruns}, data) do
+    min_lat = Float.round(min_lat / (1000 * data.cycle_time_us) * 100, 2)
+    max_lat = Float.round(max_lat / (1000 * data.cycle_time_us) * 100, 2)
+    avg_lat = Float.round(avg_lat / (1000 * data.cycle_time_us) * 100, 2)
+
     if overruns > 0 do
       Logger.warning(
-        "EtherCAT: #{cycles} cycles, latency #{min_lat}/#{avg_lat}/#{max_lat}ns, #{overruns} overruns"
+        "EtherCAT: #{cycles} cycles, latency #{min_lat}%/#{avg_lat}%/#{max_lat}%, #{overruns} overruns"
       )
     else
-      Logger.debug("EtherCAT: #{cycles} cycles, latency #{min_lat}/#{avg_lat}/#{max_lat}ns")
+      Logger.debug("EtherCAT: #{cycles} cycles, latency #{min_lat}%/#{avg_lat}%/#{max_lat}%")
     end
 
     :keep_state_and_data
