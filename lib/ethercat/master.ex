@@ -28,11 +28,9 @@ defmodule EtherCAT.Master do
   @cmd_start_cyclic 7
   @cmd_stop_cyclic 8
   @cmd_set_cycle_time 9
-  @cmd_get_master_state 10
   @cmd_get_slave_info 11
   @cmd_register_pdo 12
   @cmd_add_slave 13
-  @cmd_configure_dc 14
 
   # Async commands
   @out_set_output 4
@@ -63,13 +61,9 @@ defmodule EtherCAT.Master do
       # request_id => from
       pending_outputs: %{},
       last_slave_count: 0,
-      stability_timer: nil,
       link_up: false,
-      # Domain configuration (not yet implemented in C code)
-      domains: [],
-      # Recovery attempt tracking
-      recovery_attempts: 0,
-      max_recovery_attempts: 3
+      # Track if we should auto-restart cyclic task after recovery
+      auto_start_cyclic: false
     ]
   end
 
@@ -169,15 +163,13 @@ defmodule EtherCAT.Master do
 
     # Extract configuration options
     cycle_time_us = Keyword.get(opts, :cycle_time_us, 1_000)
-    max_recovery_attempts = Keyword.get(opts, :max_recovery_attempts, 3)
 
     # Set cycle time
     :erlang.port_control(port, @cmd_set_cycle_time, <<cycle_time_us * 1000::little-64>>)
 
     data = %Data{
       port: port,
-      cycle_time_us: cycle_time_us,
-      max_recovery_attempts: max_recovery_attempts
+      cycle_time_us: cycle_time_us
     }
 
     {:ok, :offline, data}
@@ -188,32 +180,10 @@ defmodule EtherCAT.Master do
   # ============================================================================
 
   def offline(:enter, old_state, data) do
-    # Increment recovery counter if transitioning from operational/synced (link lost scenario)
-    recovery_count =
-      case old_state do
-        state when state in [:operational, :synced] -> data.recovery_attempts + 1
-        # Reset on first entry or manual reset
-        _ -> 0
-      end
-
-    if recovery_count > data.max_recovery_attempts do
-      Logger.error(
-        "EtherCAT Master: exceeded #{data.max_recovery_attempts} recovery attempts, staying offline"
-      )
-
-      Logger.error(
-        "EtherCAT Master: manual intervention required - call EtherCAT.Master.reset() to retry"
-      )
-
-      # Stop trying - require manual intervention
-      data = %{data | recovery_attempts: recovery_count}
-      # No timeout - stay offline
-      {:keep_state, data}
-    else
-      if recovery_count > 0 do
-        Logger.warning(
-          "EtherCAT Master: entering offline state (recovery attempt #{recovery_count}/#{data.max_recovery_attempts})"
-        )
+    # Only log and cleanup on actual state change, not re-entry
+    if old_state != :offline do
+      if old_state in [:operational, :synced] do
+        Logger.warning("EtherCAT Master: entering offline state (link lost)")
       else
         Logger.info("EtherCAT Master: entering offline state")
       end
@@ -225,19 +195,30 @@ defmodule EtherCAT.Master do
       if data.port do
         :erlang.port_control(data.port, @cmd_release_master, <<>>)
       end
-
-      # Clear configuration
-      data = %{
-        data
-        | slaves: %{},
-          last_slave_count: 0,
-          link_up: false,
-          recovery_attempts: recovery_count
-      }
-
-      # Start polling for link
-      {:keep_state, data, [{:state_timeout, @link_poll_interval, :poll_link}]}
     end
+
+    # Clear runtime state but ALWAYS preserve configuration for recovery
+    # Keep: target_slave_configs, cycle_time_us, auto_start_cyclic
+    # Clear: slaves (runtime), actual_device_identities, pending commands
+    data = %{
+      data
+      | slaves: %{},
+        actual_device_identities: [],
+        last_slave_count: 0,
+        link_up: false,
+        pending_commands: %{},
+        pending_outputs: %{}
+    }
+
+    # Log preserved configuration for debugging
+    if old_state in [:operational, :synced] and data.target_slave_configs != [] do
+      Logger.info(
+        "EtherCAT Master: config preserved for #{length(data.target_slave_configs)} slaves, will auto-recover"
+      )
+    end
+
+    # Start polling for link
+    {:keep_state, data, [{:state_timeout, @link_poll_interval, :poll_link}]}
   end
 
   def offline(:state_timeout, :poll_link, data) do
@@ -286,15 +267,20 @@ defmodule EtherCAT.Master do
   end
 
   def offline({:call, from}, :reset, data) do
-    # Clear recovery attempts and restart polling
-    Logger.info("EtherCAT Master: manual reset, clearing recovery attempts")
+    Logger.info("EtherCAT Master: manual reset")
 
-    {:keep_state, %{data | recovery_attempts: 0},
-     [{:reply, from, :ok}, {:state_timeout, @link_poll_interval, :poll_link}]}
+    {:keep_state, data, [{:reply, from, :ok}, {:state_timeout, @link_poll_interval, :poll_link}]}
   end
 
-  def offline({:call, from}, {:configure_hardware, _config}, _data) do
-    {:keep_state_and_data, [{:reply, from, {:error, :offline}}]}
+  def offline({:call, from}, {:configure_hardware, config}, data) do
+    # Store the hardware config for later use when link comes up
+    data = %{data | target_slave_configs: config.slaves}
+
+    Logger.info(
+      "EtherCAT Master: hardware config stored (#{length(config.slaves)} slaves), will apply when link is established"
+    )
+
+    {:keep_state, data, [{:reply, from, {:ok, :config_stored}}]}
   end
 
   def offline({:call, from}, _request, _data) do
@@ -334,7 +320,7 @@ defmodule EtherCAT.Master do
       link_state != 1 ->
         # Link went down
         Logger.warning("EtherCAT Master: link lost during stabilization")
-        {:next_state, :offline, data}
+        {:next_state, :offline, %{data | link_up: false}}
 
       slave_count != data.last_slave_count ->
         # Topology changed, reset timer
@@ -388,8 +374,8 @@ defmodule EtherCAT.Master do
     {:keep_state_and_data, [{:reply, from, :stale}]}
   end
 
-  def stale({:call, from}, :reset, _data) do
-    {:next_state, :offline, [{:reply, from, :ok}]}
+  def stale({:call, from}, :reset, data) do
+    {:next_state, :offline, %{data | auto_start_cyclic: false}, [{:reply, from, :ok}]}
   end
 
   def stale({:call, from}, {:configure_hardware, config}, data) do
@@ -403,7 +389,7 @@ defmodule EtherCAT.Master do
   end
 
   def stale(:info, {:ecat_link, :down}, data) do
-    Logger.warning("EtherCAT Master: link lost")
+    Logger.warning("EtherCAT Master: link lost in stale (from C driver message)")
     {:next_state, :offline, %{data | link_up: false}}
   end
 
@@ -444,17 +430,35 @@ defmodule EtherCAT.Master do
 
     Logger.info("EtherCAT Master: slave configuration complete")
 
-    # Activate master to bring slaves to OP state
-    case :erlang.port_control(data.port, @cmd_activate, <<>>) do
-      <<0::little-signed-32>> ->
-        Logger.info("EtherCAT Master: slaves activated to OP state")
+    data = %{data | slaves: slaves}
 
-        {:keep_state, %{data | slaves: slaves},
-         [{:state_timeout, @state_check_interval, :monitor}]}
+    # Auto-start cyclic task if recovering from link loss
+    if data.auto_start_cyclic do
+      Logger.info("EtherCAT Master: auto-starting cyclic task after recovery")
 
-      <<err::little-signed-32>> ->
-        Logger.error("EtherCAT Master: failed to activate slaves: #{err}, returning to offline")
-        {:next_state, :offline, data}
+      # Activate master first
+      case :erlang.port_control(data.port, @cmd_activate, <<>>) do
+        <<0::little-signed-32>> ->
+          Logger.info("EtherCAT Master: slaves activated to OP state")
+
+          # Then start cyclic task
+          case :erlang.port_control(data.port, @cmd_start_cyclic, <<>>) do
+            <<0::little-signed-32>> ->
+              {:next_state, :operational, data}
+
+            <<err::little-signed-32>> ->
+              Logger.error("EtherCAT Master: failed to auto-start cyclic: #{err}, deactivating")
+              safe_deactivate(data.port)
+              {:keep_state, data, [{:state_timeout, @state_check_interval, :monitor}]}
+          end
+
+        <<err::little-signed-32>> ->
+          Logger.error("EtherCAT Master: failed to activate slaves: #{err}, returning to offline")
+          {:next_state, :offline, %{data | auto_start_cyclic: false}}
+      end
+    else
+      # Don't activate yet - wait for manual start_cyclic call
+      {:keep_state, data, [{:state_timeout, @state_check_interval, :monitor}]}
     end
   end
 
@@ -485,45 +489,42 @@ defmodule EtherCAT.Master do
   end
 
   def synced({:call, from}, {:configure_hardware, config}, data) do
-    # Store target slave configurations
+    # Store target slave configurations and transition to stale to re-verify
     data = %{data | target_slave_configs: config.slaves}
-    {:next_state, :stale, data}
+    {:next_state, :stale, data, [{:reply, from, :ok}]}
   end
 
   def synced({:call, from}, :start_cyclic, data) do
-    # Master already activated in synced(:enter), just start cyclic task
-    case :erlang.port_control(data.port, @cmd_start_cyclic, <<>>) do
+    # Activate master first
+    case :erlang.port_control(data.port, @cmd_activate, <<>>) do
       <<0::little-signed-32>> ->
-        {:next_state, :operational, data, [{:reply, from, :ok}]}
+        Logger.info("EtherCAT Master: slaves activated to OP state")
+
+        # Then start cyclic task
+        case :erlang.port_control(data.port, @cmd_start_cyclic, <<>>) do
+          <<0::little-signed-32>> ->
+            {:next_state, :operational, data, [{:reply, from, :ok}]}
+
+          <<err::little-signed-32>> ->
+            Logger.error("EtherCAT Master: failed to start cyclic task, deactivating")
+            safe_deactivate(data.port)
+            {:keep_state_and_data, [{:reply, from, {:error, {:start_cyclic, err}}}]}
+        end
 
       <<err::little-signed-32>> ->
-        {:keep_state_and_data, [{:reply, from, {:error, {:start_cyclic, err}}}]}
+        {:keep_state_and_data, [{:reply, from, {:error, {:activate, err}}}]}
     end
   end
 
   def synced({:call, from}, {:read_pdo, {slave_name, pdo_name, entry_name}}, data) do
-    # Find slave by name - O(N) scan but only happens on API calls
-    case Enum.find(data.slaves, fn {_idx, info} -> info.name == slave_name end) do
-      nil ->
-        {:keep_state_and_data, [{:reply, from, {:error, :unknown_slave}}]}
-
-      {_slave_idx, slave_info} ->
-        # Find PDO by names - O(M) scan within slave's PDOs
-        case Enum.find(slave_info.pdos, fn {_idx, info} ->
-               info.pdo_name == pdo_name and info.entry_name == entry_name
-             end) do
-          nil ->
-            {:keep_state_and_data, [{:reply, from, {:error, :unknown_pdo}}]}
-
-          {_entry_idx, pdo_info} ->
-            {:keep_state_and_data, [{:reply, from, {:ok, pdo_info.value}}]}
-        end
-    end
+    result = do_read_pdo({slave_name, pdo_name, entry_name}, data)
+    {:keep_state_and_data, [{:reply, from, result}]}
   end
 
   def synced({:call, from}, :reset, data) do
-    safe_deactivate(data.port)
-    {:next_state, :offline, data, [{:reply, from, :ok}]}
+    # Master not activated in synced state, no need to deactivate
+    # Clear auto-start flag since this is a manual reset
+    {:next_state, :offline, %{data | auto_start_cyclic: false}, [{:reply, from, :ok}]}
   end
 
   def synced({:call, from}, {:write_pdo, _, _}, _data) do
@@ -531,7 +532,7 @@ defmodule EtherCAT.Master do
   end
 
   def synced(:info, {:ecat_link, :down}, data) do
-    Logger.warning("EtherCAT Master: link lost")
+    Logger.warning("EtherCAT Master: link lost in synced (from C driver message)")
     {:next_state, :offline, %{data | link_up: false}}
   end
 
@@ -550,7 +551,8 @@ defmodule EtherCAT.Master do
 
   def operational(:enter, _old_state, data) do
     Logger.info("EtherCAT Master: entering operational state")
-    :keep_state_and_data
+    # Set flag so we auto-restart after recovery
+    {:keep_state, %{data | auto_start_cyclic: true}}
   end
 
   def operational({:call, from}, :get_state, _data) do
@@ -558,20 +560,18 @@ defmodule EtherCAT.Master do
   end
 
   def operational({:call, from}, {:write_pdo, {slave_name, pdo_name, entry_name}, value}, data) do
-    # Find slave by name - O(N) scan
     case Enum.find(data.slaves, fn {_idx, info} -> info.name == slave_name end) do
       nil ->
         {:keep_state_and_data, [{:reply, from, {:error, :unknown_slave}}]}
 
       {_slave_idx, slave_info} ->
-        # Find PDO by names - O(M) scan
         case Enum.find(slave_info.pdos, fn {_idx, info} ->
                info.pdo_name == pdo_name and info.entry_name == entry_name
              end) do
           nil ->
             {:keep_state_and_data, [{:reply, from, {:error, :unknown_pdo}}]}
 
-          {entry_index, %{direction: :input}} ->
+          {_entry_index, %{direction: :input}} ->
             {:keep_state_and_data, [{:reply, from, {:error, :not_an_output}}]}
 
           {entry_index, %{bit_length: bit_length}} ->
@@ -597,33 +597,20 @@ defmodule EtherCAT.Master do
   end
 
   def operational({:call, from}, {:read_pdo, {slave_name, pdo_name, entry_name}}, data) do
-    # Find slave by name - O(N) scan but only happens on API calls
-    case Enum.find(data.slaves, fn {_idx, info} -> info.name == slave_name end) do
-      nil ->
-        {:keep_state_and_data, [{:reply, from, {:error, :unknown_slave}}]}
-
-      {_slave_idx, slave_info} ->
-        # Find PDO by names - O(M) scan within slave's PDOs
-        case Enum.find(slave_info.pdos, fn {_idx, info} ->
-               info.pdo_name == pdo_name and info.entry_name == entry_name
-             end) do
-          nil ->
-            {:keep_state_and_data, [{:reply, from, {:error, :unknown_pdo}}]}
-
-          {_entry_idx, pdo_info} ->
-            {:keep_state_and_data, [{:reply, from, {:ok, pdo_info.value}}]}
-        end
-    end
+    result = do_read_pdo({slave_name, pdo_name, entry_name}, data)
+    {:keep_state_and_data, [{:reply, from, result}]}
   end
 
   def operational({:call, from}, :stop_cyclic, data) do
     safe_deactivate(data.port)
-    {:next_state, :stale, data, [{:reply, from, :ok}]}
+    # Clear auto-start flag since this is a manual stop
+    {:next_state, :stale, %{data | auto_start_cyclic: false}, [{:reply, from, :ok}]}
   end
 
   def operational({:call, from}, :reset, data) do
     safe_deactivate(data.port)
-    {:next_state, :offline, data, [{:reply, from, :ok}]}
+    # Clear auto-start flag since this is a manual reset
+    {:next_state, :offline, %{data | auto_start_cyclic: false}, [{:reply, from, :ok}]}
   end
 
   def operational({:call, from}, {:configure_hardware, _config}, _data) do
@@ -676,7 +663,7 @@ defmodule EtherCAT.Master do
   end
 
   def operational(:info, {:ecat_link, :down}, data) do
-    Logger.error("EtherCAT Master: link lost during operation!")
+    Logger.error("EtherCAT Master: link lost during operation (from C driver message)")
     safe_deactivate(data.port)
     {:next_state, :offline, %{data | link_up: false}}
   end
@@ -711,7 +698,7 @@ defmodule EtherCAT.Master do
   # Common Handlers
   # ============================================================================
 
-  defp handle_port_message({:ecat_response, @out_set_output, request_id}, state, data)
+  defp handle_port_message({:ecat_response, @out_set_output, request_id}, _state, data)
        when request_id >= 0 do
     # This is the initial response with request_id
     case find_pending(:set_output_init, data) do
@@ -724,7 +711,7 @@ defmodule EtherCAT.Master do
     end
   end
 
-  defp handle_port_message({:ecat_response, @out_set_output, error}, state, data) do
+  defp handle_port_message({:ecat_response, @out_set_output, error}, _state, data) do
     case find_pending(:set_output_init, data) do
       {from, pending} ->
         :gen_statem.reply(from, {:error, error})
@@ -752,6 +739,24 @@ defmodule EtherCAT.Master do
       _ ->
         nil
     end)
+  end
+
+  defp do_read_pdo({slave_name, pdo_name, entry_name}, data) do
+    case Enum.find(data.slaves, fn {_idx, info} -> info.name == slave_name end) do
+      nil ->
+        {:error, :unknown_slave}
+
+      {_slave_idx, slave_info} ->
+        case Enum.find(slave_info.pdos, fn {_idx, info} ->
+               info.pdo_name == pdo_name and info.entry_name == entry_name
+             end) do
+          nil ->
+            {:error, :unknown_pdo}
+
+          {_entry_idx, pdo_info} ->
+            {:ok, pdo_info.value}
+        end
+    end
   end
 
   defp terminate_all_drivers(slaves) do

@@ -65,7 +65,7 @@ defmodule EtherCAT.Slave.GenericDriver do
   end
 
   @impl GenServer
-  def handle_info({:ecat_pdo, {slave_name, pdo_name, entry_name}, value} = msg, state) do
+  def handle_info({:ecat_pdo, {_slave_name, _pdo_name, _entry_name}, _value} = msg, state) do
     IO.inspect(msg, label: "Received PDO update")
     {:noreply, state}
   end
