@@ -43,6 +43,8 @@ defmodule EtherCAT.Master do
   @stability_timeout 1000
   # ms - monitoring interval in :synced state
   @state_check_interval 100
+  # ms - polling interval in :offline state to check for link up
+  @poll_interval 1000
 
   defmodule Data do
     @moduledoc "State machine data"
@@ -59,8 +61,7 @@ defmodule EtherCAT.Master do
       pending_commands: %{},
       # request_id => from
       pending_outputs: %{},
-      last_slave_count: 0,
-      link_up: false
+      last_slave_count: 0
     ]
   end
 
@@ -191,8 +192,8 @@ defmodule EtherCAT.Master do
   # ============================================================================
 
   def offline(:enter, :offline, _data) do
-    # Re-entry to offline - stay offline, no polling
-    :keep_state_and_data
+    # Re-entry to offline - start polling for link
+    {:keep_state_and_data, [{:state_timeout, @poll_interval, :poll_link}]}
   end
 
   def offline(:enter, old_state, data) when old_state in [:operational, :synced, :stale] do
@@ -211,12 +212,13 @@ defmodule EtherCAT.Master do
       )
     end
 
-    {:keep_state, data}
+    # Start polling for link recovery
+    {:keep_state, data, [{:state_timeout, @poll_interval, :poll_link}]}
   end
 
   def offline(:enter, _old_state, _data) do
     Logger.info("EtherCAT Master: entering offline state")
-    :keep_state_and_data
+    {:keep_state_and_data, [{:state_timeout, @poll_interval, :poll_link}]}
   end
 
   # Handle connection attempt (from init only)
@@ -229,6 +231,19 @@ defmodule EtherCAT.Master do
       <<error::little-signed-32>> ->
         Logger.error("EtherCAT Master: failed to request master #{master_index}: #{error}")
         :keep_state_and_data
+    end
+  end
+
+  # Poll for link status - transition to stale if link is up
+  def offline(:state_timeout, :poll_link, data) do
+    case get_link_state(data.port) do
+      :up ->
+        Logger.info("EtherCAT Master: link detected, transitioning to stale")
+        {:next_state, :stale, data}
+
+      :down ->
+        # Re-arm the polling timeout
+        {:keep_state_and_data, [{:state_timeout, @poll_interval, :poll_link}]}
     end
   end
 
@@ -253,7 +268,7 @@ defmodule EtherCAT.Master do
     {:keep_state_and_data, [{:reply, from, :offline}]}
   end
 
-  def offline({:call, from}, :reset, data) do
+  def offline({:call, from}, :reset, _data) do
     Logger.info("EtherCAT Master: manual reset")
     {:keep_state_and_data, [{:reply, from, :ok}]}
   end
@@ -359,7 +374,7 @@ defmodule EtherCAT.Master do
 
   def stale(:info, {:ecat_link, :down}, data) do
     Logger.warning("EtherCAT Master: link lost in stale (from C driver message)")
-    {:next_state, :offline, %{data | link_up: false}}
+    {:next_state, :offline, data}
   end
 
   def stale(:info, {:ecat_slaves, count}, data) do
@@ -416,7 +431,7 @@ defmodule EtherCAT.Master do
     case get_link_state(data.port) do
       :down ->
         Logger.warning("EtherCAT Master: link lost")
-        {:next_state, :offline, %{data | link_up: false}}
+        {:next_state, :offline, data}
 
       :up when slave_count != data.last_slave_count ->
         Logger.warning("EtherCAT Master: topology changed, returning to stale")
@@ -466,7 +481,7 @@ defmodule EtherCAT.Master do
 
   def synced(:info, {:ecat_link, :down}, data) do
     Logger.warning("EtherCAT Master: link lost in synced (from C driver message)")
-    {:next_state, :offline, %{data | link_up: false}}
+    {:next_state, :offline, data}
   end
 
   def synced(:info, {:ecat_slaves, count}, data) when count != data.last_slave_count do
@@ -595,7 +610,7 @@ defmodule EtherCAT.Master do
   def operational(:info, {:ecat_link, :down}, data) do
     Logger.error("EtherCAT Master: link lost during operation (from C driver message)")
     safe_deactivate(data.port)
-    {:next_state, :offline, %{data | link_up: false}}
+    {:next_state, :offline, data}
   end
 
   def operational(:info, {:ecat_slaves, count}, data) when count != data.last_slave_count do
@@ -718,7 +733,6 @@ defmodule EtherCAT.Master do
       | slaves: %{},
         actual_device_identities: [],
         last_slave_count: 0,
-        link_up: false,
         pending_commands: %{},
         pending_outputs: %{}
     }
@@ -741,7 +755,7 @@ defmodule EtherCAT.Master do
 
     case get_link_state(data.port) do
       :down ->
-        {:link_down, %{data | link_up: false}}
+        {:link_down, data}
 
       :up ->
         cond do
