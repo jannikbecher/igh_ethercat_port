@@ -151,10 +151,11 @@ defmodule EtherCAT.Master do
     # Load driver - select based on config (defaults to :real)
     priv_dir = :code.priv_dir(:ethercat) |> to_string()
 
-    driver_name = case Application.get_env(:ethercat, :driver, :real) do
-      :fake -> ~c"fakeethercat_driver"
-      :real -> ~c"ethercat_driver"
-    end
+    driver_name =
+      case Application.get_env(:ethercat, :driver, :real) do
+        :fake -> ~c"fakeethercat_driver"
+        :real -> ~c"ethercat_driver"
+      end
 
     case :erl_ddll.load_driver(String.to_charlist(priv_dir), driver_name) do
       :ok ->
@@ -171,6 +172,7 @@ defmodule EtherCAT.Master do
 
     # Extract configuration options
     cycle_time_us = Keyword.get(opts, :cycle_time_us, 1_000)
+    master_index = Keyword.get(opts, :master_index, 0)
 
     # Set cycle time
     :erlang.port_control(port, @cmd_set_cycle_time, <<cycle_time_us * 1000::little-64>>)
@@ -180,82 +182,77 @@ defmodule EtherCAT.Master do
       cycle_time_us: cycle_time_us
     }
 
-    {:ok, :offline, data}
+    # Trigger connection attempt via internal event
+    {:ok, :offline, data, [{:next_event, :internal, {:connect, master_index}}]}
   end
 
   # ============================================================================
   # State: offline
   # ============================================================================
 
-  def offline(:enter, old_state, data) do
-    # Only log and cleanup on actual state change, not re-entry
-    if old_state != :offline do
-      if old_state in [:operational, :synced] do
-        Logger.warning("EtherCAT Master: entering offline state (link lost)")
-      else
-        Logger.info("EtherCAT Master: entering offline state")
-      end
+  def offline(:enter, :offline, _data) do
+    # Re-entry to offline - just keep polling
+    {:keep_state_and_data, [{:state_timeout, @link_poll_interval, :poll_link}]}
+  end
 
-      # Terminate all driver processes before clearing state
-      terminate_all_drivers(data.slaves)
+  def offline(:enter, old_state, data) when old_state in [:operational, :synced] do
+    Logger.warning("EtherCAT Master: entering offline state (link lost)")
 
-      # Release master if we have one
-      if data.port do
-        :erlang.port_control(data.port, @cmd_release_master, <<>>)
-      end
+    # Terminate all driver processes and release master
+    terminate_all_drivers(data.slaves)
+    :erlang.port_control(data.port, @cmd_release_master, <<>>)
+
+    # Clear runtime state but preserve configuration for recovery
+    data = clear_runtime_state(data)
+
+    # Log preserved configuration
+    if data.target_slave_configs != [] do
+      Logger.info(
+        "EtherCAT Master: config preserved for #{length(data.target_slave_configs)} slaves, will auto-recover"
+      )
+    else
+      Logger.warning("EtherCAT Master: no config to preserve!")
     end
 
-    # Clear runtime state but ALWAYS preserve configuration for recovery
-    # Keep: target_slave_configs, cycle_time_us, auto_start_cyclic
-    # Clear: slaves (runtime), actual_device_identities, pending commands
-    data = %{
-      data
-      | slaves: %{},
-        actual_device_identities: [],
-        last_slave_count: 0,
-        link_up: false,
-        pending_commands: %{},
-        pending_outputs: %{}
-    }
-
-    # Log preserved configuration for debugging
-    if old_state in [:operational, :synced] do
-      if data.target_slave_configs != [] do
-        Logger.info(
-          "EtherCAT Master: config preserved for #{length(data.target_slave_configs)} slaves, will auto-recover"
-        )
-      else
-        Logger.warning(
-          "EtherCAT Master: entering offline from #{old_state} but target_slave_configs is empty!"
-        )
-      end
-    end
-
-    # Start polling for link
     {:keep_state, data, [{:state_timeout, @link_poll_interval, :poll_link}]}
   end
 
-  def offline(:state_timeout, :poll_link, data) do
-    # Try to request master and check link
-    case :erlang.port_control(data.port, @cmd_request_master, <<>>) do
+  def offline(:enter, _old_state, _data) do
+    Logger.info("EtherCAT Master: entering offline state")
+    {:keep_state_and_data, []}
+  end
+
+  # Handle connection attempt (from init or retry)
+  def offline(:internal, {:connect, master_index}, data) do
+    case :erlang.port_control(data.port, @cmd_request_master, <<master_index::little-32>>) do
       <<0::little-signed-32>> ->
-        # Master requested successfully, check link
-        case :erlang.port_control(data.port, @cmd_get_link_state, <<>>) do
-          <<1::little-signed-32>> ->
-            # Link is up! Wait for physical stability before scanning
-            Logger.info("EtherCAT Master: link detected, waiting for stabilization")
+        # Master requested, start polling for link
+        {:keep_state_and_data, [{:state_timeout, @link_poll_interval, :poll_link}]}
 
-            {:keep_state, %{data | link_up: true},
-             [{:state_timeout, @link_debounce_ms, :verify_link_stable}]}
+      <<error::little-signed-32>> ->
+        Logger.error("EtherCAT Master: failed to request master #{master_index}: #{error}")
+        # Retry after interval
+        {:keep_state_and_data,
+         [{:state_timeout, @link_poll_interval, {:retry_connect, master_index}}]}
+    end
+  end
 
-          _ ->
-            # No link, release and retry
-            :erlang.port_control(data.port, @cmd_release_master, <<>>)
-            {:keep_state_and_data, [{:state_timeout, @link_poll_interval, :poll_link}]}
-        end
+  def offline(:state_timeout, {:retry_connect, master_index}, _data) do
+    {:keep_state_and_data, [{:next_event, :internal, {:connect, master_index}}]}
+  end
+
+  def offline(:state_timeout, :poll_link, data) do
+    # Check link state
+    case :erlang.port_control(data.port, @cmd_get_link_state, <<>>) do
+      <<1::little-signed-32>> ->
+        # Link is up! Wait for physical stability before scanning
+        Logger.info("EtherCAT Master: link detected, waiting for stabilization")
+
+        {:keep_state, %{data | link_up: true},
+         [{:state_timeout, @link_debounce_ms, :verify_link_stable}]}
 
       _ ->
-        # Failed to request master, retry
+        # No link, keep polling
         {:keep_state_and_data, [{:state_timeout, @link_poll_interval, :poll_link}]}
     end
   end
@@ -269,7 +266,6 @@ defmodule EtherCAT.Master do
 
       _ ->
         Logger.warning("EtherCAT Master: link unstable during debounce, retrying")
-        :erlang.port_control(data.port, @cmd_release_master, <<>>)
 
         {:keep_state, %{data | link_up: false},
          [{:state_timeout, @link_poll_interval, :poll_link}]}
@@ -795,6 +791,18 @@ defmodule EtherCAT.Master do
     :erlang.port_control(port, @cmd_stop_cyclic, <<>>)
     :erlang.port_control(port, @cmd_deactivate, <<>>)
     :ok
+  end
+
+  defp clear_runtime_state(data) do
+    %{
+      data
+      | slaves: %{},
+        actual_device_identities: [],
+        last_slave_count: 0,
+        link_up: false,
+        pending_commands: %{},
+        pending_outputs: %{}
+    }
   end
 
   # ============================================================================

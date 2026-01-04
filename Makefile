@@ -22,14 +22,16 @@ ERL_INCLUDE ?= $(shell erl -noshell -eval 'io:format("~s/erts-~s/include", [code
 
 # Use pkg-config for EtherCAT libraries
 PKG_CONFIG ?= pkg-config
-
-# Real EtherCAT driver
 ETHERCAT_CFLAGS := $(shell $(PKG_CONFIG) --cflags libethercat 2>/dev/null)
 ETHERCAT_LIBS := $(shell $(PKG_CONFIG) --libs libethercat 2>/dev/null)
 
-# Fake EtherCAT driver (for testing)
-FAKEETHERCAT_CFLAGS := $(shell $(PKG_CONFIG) --cflags libfakeethercat 2>/dev/null)
-FAKEETHERCAT_LIBS := $(shell $(PKG_CONFIG) --libs libfakeethercat 2>/dev/null)
+# Check if libfakeethercat is available (direct lib check, not pkg-config)
+FAKE_LIB_PATH ?= /usr/local/lib64
+HAS_FAKE := $(shell test -f $(FAKE_LIB_PATH)/libfakeethercat.so && echo yes)
+ifeq ($(HAS_FAKE),yes)
+	FAKEETHERCAT_CFLAGS := -I/usr/local/include
+	FAKEETHERCAT_LIBS := -L$(FAKE_LIB_PATH) -lfakeethercat
+endif
 
 # Compiler flags
 CFLAGS = -O2 -Wall -Wextra -Werror -fPIC -std=c11
@@ -53,20 +55,31 @@ FAKE_TARGET = $(PRIV_DIR)/fakeethercat_driver.so
 
 .PHONY: all clean real fake
 
+ifeq ($(HAS_FAKE),yes)
 all: real fake
+else
+all: real
+	@echo "Note: libfakeethercat not found, skipping fake driver build"
+endif
 
 real: $(REAL_TARGET)
 
+ifeq ($(HAS_FAKE),yes)
 fake: $(FAKE_TARGET)
+else
+fake:
+	@echo "libfakeethercat not available - install with: ./configure --enable-fakeuserlib"
+	@exit 1
+endif
 
 $(PRIV_DIR):
 	mkdir -p $(PRIV_DIR)
 
 $(REAL_TARGET): $(SOURCES) $(HEADERS) | $(PRIV_DIR)
-	$(CC) $(CFLAGS) $(ETHERCAT_CFLAGS) $(LDFLAGS) -o $@ $(SOURCES) $(ETHERCAT_LIBS) -lpthread -lrt
+	$(CC) $(CFLAGS) $(ETHERCAT_CFLAGS) -DDRIVER_NAME='"ethercat_driver"' $(LDFLAGS) -o $@ $(SOURCES) $(ETHERCAT_LIBS) -lpthread -lrt
 
 $(FAKE_TARGET): $(SOURCES) $(HEADERS) | $(PRIV_DIR)
-	$(CC) $(CFLAGS) $(FAKEETHERCAT_CFLAGS) $(LDFLAGS) -o $@ $(SOURCES) $(FAKEETHERCAT_LIBS) -lpthread -lrt
+	$(CC) $(CFLAGS) $(FAKEETHERCAT_CFLAGS) -DDRIVER_NAME='"fakeethercat_driver"' $(LDFLAGS) -o $@ $(SOURCES) $(FAKEETHERCAT_LIBS) -lpthread -lrt
 
 clean:
 	rm -f $(REAL_TARGET) $(FAKE_TARGET)

@@ -9,6 +9,7 @@ defmodule IghEthercatPort.MixProject do
       app: :ethercat,
       version: "0.1.0",
       elixir: "~> 1.19",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
 
@@ -29,6 +30,9 @@ defmodule IghEthercatPort.MixProject do
       source_url: @source_url
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   def application do
     [
@@ -91,7 +95,9 @@ defmodule IghEthercatPort.MixProject do
       sysroot ->
         # Nerves cross-compilation
         pkg_config_path = Path.join([sysroot, "usr", "lib", "pkgconfig"])
-        pkg_config_libdir = "#{pkg_config_path}:#{Path.join([sysroot, "usr", "share", "pkgconfig"])}"
+
+        pkg_config_libdir =
+          "#{pkg_config_path}:#{Path.join([sysroot, "usr", "share", "pkgconfig"])}"
 
         Map.merge(base_env, %{
           "PKG_CONFIG_SYSROOT_DIR" => sysroot,
@@ -110,14 +116,14 @@ defmodule IghEthercatPort.MixProject do
     2. Erlang development headers are available
     3. GCC or cross-compiler toolchain is installed
 
-    For native builds (real driver):
+    For native builds:
       - Ensure libethercat.pc is in your PKG_CONFIG_PATH
       - Install EtherCAT master with: ./configure --enable-shared
 
-    For testing (fake driver):
-      - Ensure libfakeethercat.pc is in your PKG_CONFIG_PATH
-      - Install with: ./configure --enable-fakeuserlib
-      - The fake driver will be used automatically when MIX_ENV=test
+    For testing with fake EtherCAT:
+      - Install libfakeethercat: ./configure --enable-fakeuserlib
+      - Driver links to libethercat by default
+      - Tests can use libfakeethercat via LD_LIBRARY_PATH (see test_helper.exs)
 
     For Nerves cross-compilation:
       - Set NERVES_SDK_SYSROOT to your Nerves sysroot path

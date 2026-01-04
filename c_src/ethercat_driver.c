@@ -645,7 +645,14 @@ static ErlDrvSSizeT control(ErlDrvData drv_data, unsigned int command,
                 result = -1;  // Already requested
                 break;
             }
-            state->master = ecrt_request_master(0);
+            
+            // Read master index from buffer (default to 0 if not provided)
+            uint32_t master_index = 0;
+            if (len >= sizeof(uint32_t)) {
+                memcpy(&master_index, buf, sizeof(uint32_t));
+            }
+            
+            state->master = ecrt_request_master(master_index);
             if (!state->master) {
                 result = -2;
                 break;
@@ -1015,6 +1022,10 @@ static void output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
 // Driver Entry
 // ============================================================================
 
+#ifndef DRIVER_NAME
+#define DRIVER_NAME "ethercat_driver"
+#endif
+
 static ErlDrvEntry ethercat_driver_entry = {
     .init = NULL,
     .start = start,
@@ -1022,7 +1033,7 @@ static ErlDrvEntry ethercat_driver_entry = {
     .output = output,
     .ready_input = ready_input,
     .ready_output = NULL,
-    .driver_name = "ethercat_driver",
+    .driver_name = DRIVER_NAME,
     .finish = NULL,
     .control = control,
     .timeout = NULL,
