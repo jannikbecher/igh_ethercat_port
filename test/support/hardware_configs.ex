@@ -1,4 +1,4 @@
-defmodule SimpleHardwareConfig do
+defmodule HardwareConfigs do
   @moduledoc """
   Simplified hardware configuration for basic digital I/O testing with multi-domain support.
 

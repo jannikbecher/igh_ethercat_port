@@ -35,10 +35,6 @@ defmodule EtherCAT.Master do
   # Async commands
   @out_set_output 4
 
-  # Link states
-  @link_state_up 1
-  @link_state_down 0
-
   # Timeouts
   # ms
   @link_poll_interval 1000
@@ -76,13 +72,16 @@ defmodule EtherCAT.Master do
   # ============================================================================
 
   def start_link(opts \\ []) do
-    :gen_statem.start_link({:local, __MODULE__}, __MODULE__, opts, [])
+    {name, init_opts} = Keyword.pop(opts, :name, __MODULE__)
+    :gen_statem.start_link({:local, name}, __MODULE__, init_opts, [])
   end
 
   def child_spec(opts) do
     # Allow overriding id, start args, etc. via opts
+    name = Keyword.get(opts, :name, __MODULE__)
+
     default = %{
-      id: EtherCAT.Master,
+      id: name,
       start: {EtherCAT.Master, :start_link, [opts]},
       # or :transient / :temporary depending on your needs
       restart: :permanent,
@@ -95,8 +94,8 @@ defmodule EtherCAT.Master do
   end
 
   @doc "Get current state"
-  def get_state do
-    :gen_statem.call(__MODULE__, :get_state)
+  def get_state(master \\ __MODULE__) do
+    :gen_statem.call(master, :get_state)
   end
 
   @doc """
@@ -104,40 +103,40 @@ defmodule EtherCAT.Master do
   This replaces add_slave and register_pdo. Only valid in :synced state.
   Master will only stay in :synced if actual hardware matches the configuration.
   """
-  def configure_hardware(%HardwareConfig{} = config) do
-    :gen_statem.call(__MODULE__, {:configure_hardware, config}, 30_000)
+  def configure_hardware(master \\ __MODULE__, %HardwareConfig{} = config) do
+    :gen_statem.call(master, {:configure_hardware, config}, 30_000)
   end
 
   @doc "Transition to operational state (start cyclic task)"
-  def start_cyclic do
-    :gen_statem.call(__MODULE__, :start_cyclic, 10_000)
+  def start_cyclic(master \\ __MODULE__) do
+    :gen_statem.call(master, :start_cyclic, 10_000)
   end
 
   @doc "Stop cyclic task and return to synced state"
-  def stop_cyclic do
-    :gen_statem.call(__MODULE__, :stop_cyclic, 10_000)
+  def stop_cyclic(master \\ __MODULE__) do
+    :gen_statem.call(master, :stop_cyclic, 10_000)
   end
 
   @doc """
   Write an output PDO value. Blocks until confirmed.
   Only valid in :operational state.
-  Takes a tuple {slave_name, pdo_name, entry_name} as the first parameter.
+  Takes a tuple {slave_name, pdo_name, entry_name} as the second parameter.
   """
-  def write_pdo({slave_name, pdo_name, entry_name}, value, timeout \\ 5000) do
-    :gen_statem.call(__MODULE__, {:write_pdo, {slave_name, pdo_name, entry_name}, value}, timeout)
+  def write_pdo(master \\ __MODULE__, {slave_name, pdo_name, entry_name}, value) do
+    :gen_statem.call(master, {:write_pdo, {slave_name, pdo_name, entry_name}, value})
   end
 
   @doc """
   Read current value of a PDO (from cache).
-  Takes a tuple {slave_name, pdo_name, entry_name} as parameter.
+  Takes a tuple {slave_name, pdo_name, entry_name} as the second parameter.
   """
-  def read_pdo({slave_name, pdo_name, entry_name}) do
-    :gen_statem.call(__MODULE__, {:read_pdo, {slave_name, pdo_name, entry_name}})
+  def read_pdo(master \\ __MODULE__, {slave_name, pdo_name, entry_name}) do
+    :gen_statem.call(master, {:read_pdo, {slave_name, pdo_name, entry_name}})
   end
 
   @doc "Force transition back to offline (for testing/recovery)"
-  def reset do
-    :gen_statem.call(__MODULE__, :reset, 10_000)
+  def reset(master \\ __MODULE__) do
+    :gen_statem.call(master, :reset, 10_000)
   end
 
   # ============================================================================
@@ -349,7 +348,7 @@ defmodule EtherCAT.Master do
 
         {:keep_state_and_data, [{:state_timeout, @state_check_interval, :check_stability}]}
 
-      {:hardware_mismatch, slave_count} ->
+      {:hardware_mismatch, _slave_count} ->
         Logger.warning(
           "EtherCAT Master: topology stable but hardware does not match configuration"
         )
@@ -772,7 +771,7 @@ defmodule EtherCAT.Master do
 
   defp get_link_state(port) do
     case :erlang.port_control(port, @cmd_get_link_state, <<>>) do
-      <<@link_state_up::little-signed-32>> -> :up
+      <<1::little-signed-32>> -> :up
       _ -> :down
     end
   end
