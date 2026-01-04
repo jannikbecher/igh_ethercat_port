@@ -16,6 +16,7 @@ defmodule IghEthercatPort.MixProject do
       compilers: [:elixir_make] ++ Mix.compilers(),
       make_clean: ["clean"],
       make_targets: ["all"],
+      make_env: make_env(),
       make_error_message: make_error_message(),
 
       # Hex
@@ -78,19 +79,50 @@ defmodule IghEthercatPort.MixProject do
     ]
   end
 
+  defp make_env do
+    # Setup environment for Nerves cross-compilation
+    base_env = %{}
+
+    case System.get_env("NERVES_SDK_SYSROOT") do
+      nil ->
+        # Native build - pkg-config will find system libraries
+        base_env
+
+      sysroot ->
+        # Nerves cross-compilation
+        pkg_config_path = Path.join([sysroot, "usr", "lib", "pkgconfig"])
+        pkg_config_libdir = "#{pkg_config_path}:#{Path.join([sysroot, "usr", "share", "pkgconfig"])}"
+
+        Map.merge(base_env, %{
+          "PKG_CONFIG_SYSROOT_DIR" => sysroot,
+          "PKG_CONFIG_LIBDIR" => pkg_config_libdir,
+          "CROSSCOMPILE" => System.get_env("CROSSCOMPILE", "")
+        })
+    end
+  end
+
   defp make_error_message do
     """
     Could not compile the EtherCAT driver.
 
     Please ensure:
-    1. The IgH EtherCAT Master is installed (default: /opt/etherlab)
+    1. The IgH EtherCAT Master is installed with pkg-config support
     2. Erlang development headers are available
-    3. GCC is installed
+    3. GCC or cross-compiler toolchain is installed
 
-    Run 'make check' for detailed diagnostics.
+    For native builds (real driver):
+      - Ensure libethercat.pc is in your PKG_CONFIG_PATH
+      - Install EtherCAT master with: ./configure --enable-shared
 
-    If EtherCAT is installed in a non-standard location, set:
-      export ETHERCAT_PATH=/path/to/ethercat
+    For testing (fake driver):
+      - Ensure libfakeethercat.pc is in your PKG_CONFIG_PATH
+      - Install with: ./configure --enable-fakeuserlib
+      - The fake driver will be used automatically when MIX_ENV=test
+
+    For Nerves cross-compilation:
+      - Set NERVES_SDK_SYSROOT to your Nerves sysroot path
+      - Set CROSSCOMPILE to your cross-compiler prefix
+      - Ensure libethercat is built in the Nerves system
     """
   end
 end

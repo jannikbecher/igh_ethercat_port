@@ -148,10 +148,15 @@ defmodule EtherCAT.Master do
     # Trap exits so linked driver processes don't crash the Master
     Process.flag(:trap_exit, true)
 
-    # Load driver
+    # Load driver - select based on config (defaults to :real)
     priv_dir = :code.priv_dir(:ethercat) |> to_string()
 
-    case :erl_ddll.load_driver(String.to_charlist(priv_dir), ~c"ethercat_driver") do
+    driver_name = case Application.get_env(:ethercat, :driver, :real) do
+      :fake -> ~c"fakeethercat_driver"
+      :real -> ~c"ethercat_driver"
+    end
+
+    case :erl_ddll.load_driver(String.to_charlist(priv_dir), driver_name) do
       :ok ->
         :ok
 
@@ -159,10 +164,10 @@ defmodule EtherCAT.Master do
         :ok
 
       {:error, reason} ->
-        raise "Failed to load ethercat_driver: #{:erl_ddll.format_error(reason)}"
+        raise "Failed to load #{driver_name}: #{:erl_ddll.format_error(reason)}"
     end
 
-    port = Port.open({:spawn_driver, ~c"ethercat_driver"}, [:binary])
+    port = Port.open({:spawn_driver, driver_name}, [:binary])
 
     # Extract configuration options
     cycle_time_us = Keyword.get(opts, :cycle_time_us, 1_000)
