@@ -35,6 +35,10 @@ defmodule EtherCAT.Master do
   # Async commands
   @out_set_output 4
 
+  # Link states
+  @link_state_up 1
+  @link_state_down 0
+
   # Timeouts
   # ms
   @link_poll_interval 1000
@@ -242,29 +246,27 @@ defmodule EtherCAT.Master do
   end
 
   def offline(:state_timeout, :poll_link, data) do
-    # Check link state
-    case :erlang.port_control(data.port, @cmd_get_link_state, <<>>) do
-      <<1::little-signed-32>> ->
+    case get_link_state(data.port) do
+      :up ->
         # Link is up! Wait for physical stability before scanning
         Logger.info("EtherCAT Master: link detected, waiting for stabilization")
 
         {:keep_state, %{data | link_up: true},
          [{:state_timeout, @link_debounce_ms, :verify_link_stable}]}
 
-      _ ->
+      :down ->
         # No link, keep polling
         {:keep_state_and_data, [{:state_timeout, @link_poll_interval, :poll_link}]}
     end
   end
 
   def offline(:state_timeout, :verify_link_stable, data) do
-    # Re-check link after debounce period
-    case :erlang.port_control(data.port, @cmd_get_link_state, <<>>) do
-      <<1::little-signed-32>> ->
+    case get_link_state(data.port) do
+      :up ->
         Logger.info("EtherCAT Master: link stable, transitioning to stale")
         {:next_state, :stale, data}
 
-      _ ->
+      :down ->
         Logger.warning("EtherCAT Master: link unstable during debounce, retrying")
 
         {:keep_state, %{data | link_up: false},
@@ -313,10 +315,7 @@ defmodule EtherCAT.Master do
   def stale(:enter, _old_state, data) do
     Logger.info("EtherCAT Master: entering stale state, waiting for topology to stabilize")
 
-    # Get initial slave count
-    <<slave_count::little-signed-32>> =
-      :erlang.port_control(data.port, @cmd_scan_slaves, <<>>)
-
+    slave_count = scan_slave_count(data.port)
     data = %{data | last_slave_count: slave_count}
 
     # Start stability timer
@@ -324,64 +323,45 @@ defmodule EtherCAT.Master do
   end
 
   def stale(:state_timeout, :check_stability, data) do
-    # Check if topology is still the same
-    <<slave_count::little-signed-32>> =
-      :erlang.port_control(data.port, @cmd_scan_slaves, <<>>)
-
-    <<link_state::little-signed-32>> =
-      :erlang.port_control(data.port, @cmd_get_link_state, <<>>)
-
-    cond do
-      link_state != 1 ->
-        # Link went down
+    case check_link_and_topology(data) do
+      {:link_down, data} ->
         Logger.warning("EtherCAT Master: link lost during stabilization")
-        {:next_state, :offline, %{data | link_up: false}}
+        {:next_state, :offline, data}
 
-      slave_count != data.last_slave_count ->
-        # Topology changed, reset timer
+      {:topology_changed, slave_count, data} ->
         Logger.debug(
           "EtherCAT Master: topology changed (#{data.last_slave_count} -> #{slave_count})"
         )
 
-        {:keep_state, %{data | last_slave_count: slave_count},
-         [{:state_timeout, @stability_timeout, :check_stability}]}
+        {:keep_state, data, [{:state_timeout, @stability_timeout, :check_stability}]}
 
-      # Only transition to synced if hardware config is set AND matches
-      data.target_slave_configs == [] ->
-        # No hardware config set yet, stay in stale and keep checking
+      {:no_config, slave_count} ->
         Logger.debug(
           "EtherCAT Master: topology stable with #{slave_count} slaves, waiting for hardware config"
         )
 
         {:keep_state_and_data, [{:state_timeout, @state_check_interval, :check_stability}]}
 
-      length(data.target_slave_configs) != slave_count ->
-        # Hardware config doesn't match slave count, stay in stale
+      {:config_mismatch, slave_count, expected} ->
         Logger.warning(
-          "EtherCAT Master: topology stable with #{slave_count} slaves, but config expects #{length(data.target_slave_configs)}"
+          "EtherCAT Master: topology stable with #{slave_count} slaves, but config expects #{expected}"
         )
 
         {:keep_state_and_data, [{:state_timeout, @state_check_interval, :check_stability}]}
 
-      true ->
-        # Scan actual device identities and verify they match config
-        actual_identities = scan_slave_identities(data.port, slave_count)
+      {:hardware_mismatch, slave_count} ->
+        Logger.warning(
+          "EtherCAT Master: topology stable but hardware does not match configuration"
+        )
 
-        if hardware_matches?(data.target_slave_configs, actual_identities) do
-          # Hardware matches! Transition to synced
-          Logger.info(
-            "EtherCAT Master: topology stable with #{slave_count} slaves, hardware verified"
-          )
+        {:keep_state_and_data, [{:state_timeout, @state_check_interval, :check_stability}]}
 
-          {:next_state, :synced, %{data | actual_device_identities: actual_identities}}
-        else
-          # Hardware doesn't match config
-          Logger.warning(
-            "EtherCAT Master: topology stable but hardware does not match configuration"
-          )
+      {:ready, slave_count, actual_identities} ->
+        Logger.info(
+          "EtherCAT Master: topology stable with #{slave_count} slaves, hardware verified"
+        )
 
-          {:keep_state_and_data, [{:state_timeout, @state_check_interval, :check_stability}]}
-        end
+        {:next_state, :synced, %{data | actual_device_identities: actual_identities}}
     end
   end
 
@@ -456,25 +436,15 @@ defmodule EtherCAT.Master do
     if data.auto_start_cyclic do
       Logger.info("EtherCAT Master: auto-starting cyclic task after recovery")
 
-      # Activate master first
-      case :erlang.port_control(data.port, @cmd_activate, <<>>) do
-        <<0::little-signed-32>> ->
+      case activate_and_start_cyclic(data.port) do
+        :ok ->
           Logger.info("EtherCAT Master: slaves activated to OP state")
+          {:next_state, :operational, data}
 
-          # Then start cyclic task
-          case :erlang.port_control(data.port, @cmd_start_cyclic, <<>>) do
-            <<0::little-signed-32>> ->
-              {:next_state, :operational, data}
-
-            <<err::little-signed-32>> ->
-              Logger.error("EtherCAT Master: failed to auto-start cyclic: #{err}, deactivating")
-              safe_deactivate(data.port)
-              {:keep_state, data, [{:state_timeout, @state_check_interval, :monitor}]}
-          end
-
-        <<err::little-signed-32>> ->
-          Logger.error("EtherCAT Master: failed to activate slaves: #{err}, returning to offline")
-          {:next_state, :offline, %{data | auto_start_cyclic: false}}
+        :error ->
+          Logger.error("EtherCAT Master: failed to activate and start cyclic, deactivating")
+          safe_deactivate(data.port)
+          {:keep_state, data, [{:state_timeout, @state_check_interval, :monitor}]}
       end
     else
       # Don't activate yet - wait for manual start_cyclic call
@@ -483,23 +453,18 @@ defmodule EtherCAT.Master do
   end
 
   def synced(:state_timeout, :monitor, data) do
-    # Check link and slave count
-    <<link_state::little-signed-32>> =
-      :erlang.port_control(data.port, @cmd_get_link_state, <<>>)
+    slave_count = scan_slave_count(data.port)
 
-    <<slave_count::little-signed-32>> =
-      :erlang.port_control(data.port, @cmd_scan_slaves, <<>>)
-
-    cond do
-      link_state != 1 ->
+    case get_link_state(data.port) do
+      :down ->
         Logger.warning("EtherCAT Master: link lost")
         {:next_state, :offline, %{data | link_up: false}}
 
-      slave_count != data.last_slave_count ->
+      :up when slave_count != data.last_slave_count ->
         Logger.warning("EtherCAT Master: topology changed, returning to stale")
         {:next_state, :stale, %{data | last_slave_count: slave_count}}
 
-      true ->
+      :up ->
         {:keep_state_and_data, [{:state_timeout, @state_check_interval, :monitor}]}
     end
   end
@@ -515,24 +480,15 @@ defmodule EtherCAT.Master do
   end
 
   def synced({:call, from}, :start_cyclic, data) do
-    # Activate master first
-    case :erlang.port_control(data.port, @cmd_activate, <<>>) do
-      <<0::little-signed-32>> ->
+    case activate_and_start_cyclic(data.port) do
+      :ok ->
         Logger.info("EtherCAT Master: slaves activated to OP state")
+        {:next_state, :operational, data, [{:reply, from, :ok}]}
 
-        # Then start cyclic task
-        case :erlang.port_control(data.port, @cmd_start_cyclic, <<>>) do
-          <<0::little-signed-32>> ->
-            {:next_state, :operational, data, [{:reply, from, :ok}]}
-
-          <<err::little-signed-32>> ->
-            Logger.error("EtherCAT Master: failed to start cyclic task, deactivating")
-            safe_deactivate(data.port)
-            {:keep_state_and_data, [{:reply, from, {:error, {:start_cyclic, err}}}]}
-        end
-
-      <<err::little-signed-32>> ->
-        {:keep_state_and_data, [{:reply, from, {:error, {:activate, err}}}]}
+      :error ->
+        Logger.error("EtherCAT Master: failed to activate and start cyclic, deactivating")
+        safe_deactivate(data.port)
+        {:keep_state_and_data, [{:reply, from, {:error, :activation_failed}}]}
     end
   end
 
@@ -787,6 +743,15 @@ defmodule EtherCAT.Master do
     end)
   end
 
+  defp activate_and_start_cyclic(port) do
+    with <<0::little-signed-32>> <- :erlang.port_control(port, @cmd_activate, <<>>),
+         <<0::little-signed-32>> <- :erlang.port_control(port, @cmd_start_cyclic, <<>>) do
+      :ok
+    else
+      <<_err::little-signed-32>> -> :error
+    end
+  end
+
   defp safe_deactivate(port) do
     :erlang.port_control(port, @cmd_stop_cyclic, <<>>)
     :erlang.port_control(port, @cmd_deactivate, <<>>)
@@ -803,6 +768,48 @@ defmodule EtherCAT.Master do
         pending_commands: %{},
         pending_outputs: %{}
     }
+  end
+
+  defp get_link_state(port) do
+    case :erlang.port_control(port, @cmd_get_link_state, <<>>) do
+      <<@link_state_up::little-signed-32>> -> :up
+      _ -> :down
+    end
+  end
+
+  defp scan_slave_count(port) do
+    <<slave_count::little-signed-32>> = :erlang.port_control(port, @cmd_scan_slaves, <<>>)
+    slave_count
+  end
+
+  defp check_link_and_topology(data) do
+    slave_count = scan_slave_count(data.port)
+
+    case get_link_state(data.port) do
+      :down ->
+        {:link_down, %{data | link_up: false}}
+
+      :up ->
+        cond do
+          slave_count != data.last_slave_count ->
+            {:topology_changed, slave_count, %{data | last_slave_count: slave_count}}
+
+          data.target_slave_configs == [] ->
+            {:no_config, slave_count}
+
+          length(data.target_slave_configs) != slave_count ->
+            {:config_mismatch, slave_count, length(data.target_slave_configs)}
+
+          true ->
+            actual_identities = scan_slave_identities(data.port, slave_count)
+
+            if hardware_matches?(data.target_slave_configs, actual_identities) do
+              {:ready, slave_count, actual_identities}
+            else
+              {:hardware_mismatch, slave_count}
+            end
+        end
+    end
   end
 
   # ============================================================================
@@ -861,44 +868,58 @@ defmodule EtherCAT.Master do
   defp configure_and_register_slave(slave_config, slave_index, device_identity, port) do
     Logger.debug("Configuring slave #{slave_index}: #{slave_config.name}")
 
-    alias = 0x0000
+    add_slave_to_master(slave_config, slave_index, device_identity, port)
+    driver_pid = start_slave_driver(slave_config)
+    configure_slave_sdos(slave_config, driver_pid)
+    configure_slave_pdos(slave_config, driver_pid)
+    pdos = register_slave_pdo_entries(slave_config, slave_index, driver_pid, port)
 
-    # Step 1: Add slave to EtherCAT master
-    identity = device_identity
+    %{
+      name: slave_config.name,
+      device_identity: device_identity,
+      driver_pid: driver_pid,
+      pdos: pdos
+    }
+  end
+
+  defp add_slave_to_master(slave_config, slave_index, device_identity, port) do
+    alias = 0x0000
 
     cmd_data = <<
       alias::little-16,
       slave_index::little-16,
-      identity.vendor_id::little-32,
-      identity.product_code::little-32
+      device_identity.vendor_id::little-32,
+      device_identity.product_code::little-32
     >>
 
     case :erlang.port_control(port, @cmd_add_slave, cmd_data) do
       <<result::little-signed-32>> when result >= 0 ->
         Logger.debug("  Added slave to master (index: #{result})")
+        :ok
 
       <<error::little-signed-32>> ->
         Logger.error("  Failed to add slave to master: #{error}")
         raise "Failed to add slave #{slave_config.name} to EtherCAT master"
     end
+  end
 
-    # Step 2: Start driver
-    driver_pid =
-      if slave_config.driver do
-        case slave_config.driver.start_driver(slave_config.name, slave_config.config) do
-          {:ok, pid} ->
-            Logger.debug("  Started driver: #{inspect(slave_config.driver)}")
-            pid
+  defp start_slave_driver(slave_config) do
+    if slave_config.driver do
+      case slave_config.driver.start_driver(slave_config.name, slave_config.config) do
+        {:ok, pid} ->
+          Logger.debug("  Started driver: #{inspect(slave_config.driver)}")
+          pid
 
-          error ->
-            Logger.warning("  Failed to start driver: #{inspect(error)}")
-            nil
-        end
-      else
-        nil
+        error ->
+          Logger.warning("  Failed to start driver: #{inspect(error)}")
+          nil
       end
+    else
+      nil
+    end
+  end
 
-    # Step 2: Configure SDOs
+  defp configure_slave_sdos(slave_config, driver_pid) do
     if driver_pid && slave_config.driver do
       sdos = slave_config.driver.get_sdo_config(driver_pid)
 
@@ -907,8 +928,9 @@ defmodule EtherCAT.Master do
         # TODO: Send SDO write to C driver
       end
     end
+  end
 
-    # Step 3: Configure PDO mapping
+  defp configure_slave_pdos(slave_config, driver_pid) do
     if driver_pid && slave_config.driver do
       sync_managers = slave_config.driver.get_pdo_config(driver_pid)
 
@@ -920,80 +942,97 @@ defmodule EtherCAT.Master do
         # TODO: Send PDO mapping to C driver
       end
     end
+  end
 
-    # Step 4: Register PDO entries from registered_entries
-    pdos =
-      if driver_pid && slave_config.driver do
-        sync_managers = slave_config.driver.get_pdo_config(driver_pid)
+  defp register_slave_pdo_entries(slave_config, slave_index, driver_pid, port) do
+    if driver_pid && slave_config.driver do
+      sync_managers = slave_config.driver.get_pdo_config(driver_pid)
 
-        slave_config.registered_entries
-        |> Enum.flat_map(fn {_domain, entries} -> entries end)
-        |> Enum.reduce(%{}, fn {pdo_name, entry_name, deadband, interval_us}, acc ->
-          # Find the PDO and entry in sync_managers to get technical details
-          case find_pdo_entry(sync_managers, pdo_name, entry_name) do
-            {:ok, {pdo_index, subindex, bit_length, direction}} ->
-              # Register with C driver (synchronous - waits for entry_index)
-              case register_pdo(
-                     port,
-                     slave_index,
-                     pdo_index,
-                     subindex,
-                     bit_length,
-                     direction,
-                     deadband,
-                     interval_us,
-                     pdo_name,
-                     entry_name
-                   ) do
-                {:ok, entry_index} ->
-                  # Notify driver
-                  case slave_config.driver.register_pdo_entry(driver_pid, pdo_name, entry_name) do
-                    :ok ->
-                      Logger.debug("  Registered #{pdo_name}.#{entry_name}")
-
-                    {:error, reason} ->
-                      Logger.warning(
-                        "  Driver failed to register #{pdo_name}.#{entry_name}: #{inspect(reason)}"
-                      )
-                  end
-
-                  # Add PDO info to map
-                  pdo_info = %{
-                    pdo_name: pdo_name,
-                    entry_name: entry_name,
-                    bit_length: bit_length,
-                    direction: direction,
-                    deadband: deadband,
-                    interval_us: interval_us,
-                    value: nil
-                  }
-
-                  Map.put(acc, entry_index, pdo_info)
-
-                {:error, reason} ->
-                  Logger.error(
-                    "  Failed to register #{pdo_name}.#{entry_name}: #{inspect(reason)}"
-                  )
-
-                  acc
-              end
-
-            :not_found ->
-              Logger.warning("  PDO entry #{pdo_name}.#{entry_name} not found in driver config")
+      slave_config.registered_entries
+      |> Enum.flat_map(fn {_domain, entries} -> entries end)
+      |> Enum.reduce(%{}, fn {pdo_name, entry_name, deadband, interval_us}, acc ->
+        case find_pdo_entry(sync_managers, pdo_name, entry_name) do
+          {:ok, {pdo_index, subindex, bit_length, direction}} ->
+            register_single_pdo_entry(
+              slave_config,
+              slave_index,
+              driver_pid,
+              port,
+              pdo_name,
+              entry_name,
+              pdo_index,
+              subindex,
+              bit_length,
+              direction,
+              deadband,
+              interval_us,
               acc
-          end
-        end)
-      else
-        %{}
-      end
+            )
 
-    # Return slave_info
-    %{
-      name: slave_config.name,
-      device_identity: device_identity,
-      driver_pid: driver_pid,
-      pdos: pdos
-    }
+          :not_found ->
+            Logger.warning("  PDO entry #{pdo_name}.#{entry_name} not found in driver config")
+            acc
+        end
+      end)
+    else
+      %{}
+    end
+  end
+
+  defp register_single_pdo_entry(
+         slave_config,
+         slave_index,
+         driver_pid,
+         port,
+         pdo_name,
+         entry_name,
+         pdo_index,
+         subindex,
+         bit_length,
+         direction,
+         deadband,
+         interval_us,
+         acc
+       ) do
+    case register_pdo(
+           port,
+           slave_index,
+           pdo_index,
+           subindex,
+           bit_length,
+           direction,
+           deadband,
+           interval_us,
+           pdo_name,
+           entry_name
+         ) do
+      {:ok, entry_index} ->
+        case slave_config.driver.register_pdo_entry(driver_pid, pdo_name, entry_name) do
+          :ok ->
+            Logger.debug("  Registered #{pdo_name}.#{entry_name}")
+
+          {:error, reason} ->
+            Logger.warning(
+              "  Driver failed to register #{pdo_name}.#{entry_name}: #{inspect(reason)}"
+            )
+        end
+
+        pdo_info = %{
+          pdo_name: pdo_name,
+          entry_name: entry_name,
+          bit_length: bit_length,
+          direction: direction,
+          deadband: deadband,
+          interval_us: interval_us,
+          value: nil
+        }
+
+        Map.put(acc, entry_index, pdo_info)
+
+      {:error, reason} ->
+        Logger.error("  Failed to register #{pdo_name}.#{entry_name}: #{inspect(reason)}")
+        acc
+    end
   end
 
   defp find_pdo_entry(sync_managers, pdo_name, entry_name) do
