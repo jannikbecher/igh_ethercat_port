@@ -3,10 +3,13 @@ defmodule EtherCAT.Master do
   EtherCAT Master state machine.
 
   States:
-  - `:offline`      - No link, polling for connection
+  - `:offline`      - No link or manual offline, waiting for user action
   - `:stale`        - Link up, waiting for topology to stabilize
-  - `:synced`       - Hardware verified, ready for configuration
+  - `:synced`       - Hardware verified, slaves configured, ready for cyclic operation
   - `:operational`  - Cyclic task running, real-time I/O active
+
+  Note: The master does NOT auto-recover after link loss. After entering `:offline`,
+  the user must manually call `start_cyclic/1` to attempt recovery.
   """
 
   @behaviour :gen_statem
@@ -36,14 +39,10 @@ defmodule EtherCAT.Master do
   @out_set_output 4
 
   # Timeouts
-  # ms
-  @link_poll_interval 1000
-  # ms - how long topology must be stable
+  # ms - how long topology must be stable before transitioning to synced
   @stability_timeout 1000
-  # ms - monitoring interval in :synced
+  # ms - monitoring interval in :synced state
   @state_check_interval 100
-  # ms - wait after link-up before scanning
-  @link_debounce_ms 500
 
   defmodule Data do
     @moduledoc "State machine data"
@@ -61,9 +60,7 @@ defmodule EtherCAT.Master do
       # request_id => from
       pending_outputs: %{},
       last_slave_count: 0,
-      link_up: false,
-      # Track if we should auto-restart cyclic task after recovery
-      auto_start_cyclic: false
+      link_up: false
     ]
   end
 
@@ -194,82 +191,61 @@ defmodule EtherCAT.Master do
   # ============================================================================
 
   def offline(:enter, :offline, _data) do
-    # Re-entry to offline - just keep polling
-    {:keep_state_and_data, [{:state_timeout, @link_poll_interval, :poll_link}]}
+    # Re-entry to offline - stay offline, no polling
+    :keep_state_and_data
   end
 
-  def offline(:enter, old_state, data) when old_state in [:operational, :synced] do
-    Logger.warning("EtherCAT Master: entering offline state (link lost)")
+  def offline(:enter, old_state, data) when old_state in [:operational, :synced, :stale] do
+    Logger.warning("EtherCAT Master: entering offline state from #{old_state}")
 
-    # Terminate all driver processes and release master
+    # Terminate all driver processes and clear runtime state
     terminate_all_drivers(data.slaves)
-    :erlang.port_control(data.port, @cmd_release_master, <<>>)
 
-    # Clear runtime state but preserve configuration for recovery
+    # Clear runtime state but preserve configuration for manual recovery
     data = clear_runtime_state(data)
 
     # Log preserved configuration
     if data.target_slave_configs != [] do
       Logger.info(
-        "EtherCAT Master: config preserved for #{length(data.target_slave_configs)} slaves, will auto-recover"
+        "EtherCAT Master: config preserved (#{length(data.target_slave_configs)} slaves), call start_cyclic/0 to recover"
       )
-    else
-      Logger.warning("EtherCAT Master: no config to preserve!")
     end
 
-    {:keep_state, data, [{:state_timeout, @link_poll_interval, :poll_link}]}
+    {:keep_state, data}
   end
 
   def offline(:enter, _old_state, _data) do
     Logger.info("EtherCAT Master: entering offline state")
-    {:keep_state_and_data, []}
+    :keep_state_and_data
   end
 
-  # Handle connection attempt (from init or retry)
+  # Handle connection attempt (from init only)
   def offline(:internal, {:connect, master_index}, data) do
     case :erlang.port_control(data.port, @cmd_request_master, <<master_index::little-32>>) do
       <<0::little-signed-32>> ->
-        # Master requested, start polling for link
-        {:keep_state_and_data, [{:state_timeout, @link_poll_interval, :poll_link}]}
+        Logger.info("EtherCAT Master: master #{master_index} reserved, waiting in offline state")
+        :keep_state_and_data
 
       <<error::little-signed-32>> ->
         Logger.error("EtherCAT Master: failed to request master #{master_index}: #{error}")
-        # Retry after interval
-        {:keep_state_and_data,
-         [{:state_timeout, @link_poll_interval, {:retry_connect, master_index}}]}
+        :keep_state_and_data
     end
   end
 
-  def offline(:state_timeout, {:retry_connect, master_index}, _data) do
-    {:keep_state_and_data, [{:next_event, :internal, {:connect, master_index}}]}
-  end
+  # Manual start_cyclic - attempt to recover after link down
+  def offline({:call, from}, :start_cyclic, data) do
+    if data.target_slave_configs == [] do
+      {:keep_state_and_data, [{:reply, from, {:error, :no_config}}]}
+    else
+      # Check if link is up before attempting recovery
+      case get_link_state(data.port) do
+        :up ->
+          Logger.info("EtherCAT Master: manual recovery requested, link detected")
+          {:next_state, :stale, data, [{:reply, from, :ok}]}
 
-  def offline(:state_timeout, :poll_link, data) do
-    case get_link_state(data.port) do
-      :up ->
-        # Link is up! Wait for physical stability before scanning
-        Logger.info("EtherCAT Master: link detected, waiting for stabilization")
-
-        {:keep_state, %{data | link_up: true},
-         [{:state_timeout, @link_debounce_ms, :verify_link_stable}]}
-
-      :down ->
-        # No link, keep polling
-        {:keep_state_and_data, [{:state_timeout, @link_poll_interval, :poll_link}]}
-    end
-  end
-
-  def offline(:state_timeout, :verify_link_stable, data) do
-    case get_link_state(data.port) do
-      :up ->
-        Logger.info("EtherCAT Master: link stable, transitioning to stale")
-        {:next_state, :stale, data}
-
-      :down ->
-        Logger.warning("EtherCAT Master: link unstable during debounce, retrying")
-
-        {:keep_state, %{data | link_up: false},
-         [{:state_timeout, @link_poll_interval, :poll_link}]}
+        :down ->
+          {:keep_state_and_data, [{:reply, from, {:error, :link_down}}]}
+      end
     end
   end
 
@@ -279,8 +255,7 @@ defmodule EtherCAT.Master do
 
   def offline({:call, from}, :reset, data) do
     Logger.info("EtherCAT Master: manual reset")
-
-    {:keep_state, data, [{:reply, from, :ok}, {:state_timeout, @link_poll_interval, :poll_link}]}
+    {:keep_state_and_data, [{:reply, from, :ok}]}
   end
 
   def offline({:call, from}, {:configure_hardware, config}, data) do
@@ -368,8 +343,8 @@ defmodule EtherCAT.Master do
     {:keep_state_and_data, [{:reply, from, :stale}]}
   end
 
-  def stale({:call, from}, :reset, data) do
-    {:next_state, :offline, %{data | auto_start_cyclic: false}, [{:reply, from, :ok}]}
+  def stale({:call, from}, :reset, _data) do
+    {:next_state, :offline, [{:reply, from, :ok}]}
   end
 
   def stale({:call, from}, {:configure_hardware, config}, data) do
@@ -427,28 +402,12 @@ defmodule EtherCAT.Master do
       end)
       |> Map.new()
 
-    Logger.info("EtherCAT Master: slave configuration complete")
+    Logger.info("EtherCAT Master: slave configuration complete, ready for cyclic operation")
 
     data = %{data | slaves: slaves}
 
-    # Auto-start cyclic task if recovering from link loss
-    if data.auto_start_cyclic do
-      Logger.info("EtherCAT Master: auto-starting cyclic task after recovery")
-
-      case activate_and_start_cyclic(data.port) do
-        :ok ->
-          Logger.info("EtherCAT Master: slaves activated to OP state")
-          {:next_state, :operational, data}
-
-        :error ->
-          Logger.error("EtherCAT Master: failed to activate and start cyclic, deactivating")
-          safe_deactivate(data.port)
-          {:keep_state, data, [{:state_timeout, @state_check_interval, :monitor}]}
-      end
-    else
-      # Don't activate yet - wait for manual start_cyclic call
-      {:keep_state, data, [{:state_timeout, @state_check_interval, :monitor}]}
-    end
+    # Wait for manual start_cyclic call
+    {:keep_state, data, [{:state_timeout, @state_check_interval, :monitor}]}
   end
 
   def synced(:state_timeout, :monitor, data) do
@@ -496,10 +455,9 @@ defmodule EtherCAT.Master do
     {:keep_state_and_data, [{:reply, from, result}]}
   end
 
-  def synced({:call, from}, :reset, data) do
+  def synced({:call, from}, :reset, _data) do
     # Master not activated in synced state, no need to deactivate
-    # Clear auto-start flag since this is a manual reset
-    {:next_state, :offline, %{data | auto_start_cyclic: false}, [{:reply, from, :ok}]}
+    {:next_state, :offline, [{:reply, from, :ok}]}
   end
 
   def synced({:call, from}, {:write_pdo, _, _}, _data) do
@@ -524,10 +482,9 @@ defmodule EtherCAT.Master do
   # State: operational
   # ============================================================================
 
-  def operational(:enter, _old_state, data) do
+  def operational(:enter, _old_state, _data) do
     Logger.info("EtherCAT Master: entering operational state")
-    # Set flag so we auto-restart after recovery
-    {:keep_state, %{data | auto_start_cyclic: true}}
+    :keep_state_and_data
   end
 
   def operational({:call, from}, :get_state, _data) do
@@ -578,14 +535,12 @@ defmodule EtherCAT.Master do
 
   def operational({:call, from}, :stop_cyclic, data) do
     safe_deactivate(data.port)
-    # Clear auto-start flag since this is a manual stop
-    {:next_state, :stale, %{data | auto_start_cyclic: false}, [{:reply, from, :ok}]}
+    {:next_state, :synced, data, [{:reply, from, :ok}]}
   end
 
   def operational({:call, from}, :reset, data) do
     safe_deactivate(data.port)
-    # Clear auto-start flag since this is a manual reset
-    {:next_state, :offline, %{data | auto_start_cyclic: false}, [{:reply, from, :ok}]}
+    {:next_state, :offline, data, [{:reply, from, :ok}]}
   end
 
   def operational({:call, from}, {:configure_hardware, _config}, _data) do
@@ -846,12 +801,19 @@ defmodule EtherCAT.Master do
       # Check each slave's device_identity matches (order-dependent)
       target_slave_configs
       |> Enum.zip(actual_device_identities)
-      |> Enum.all?(fn {%HardwareConfig.SlaveConfig{device_identity: target_identity},
-                       actual_identity} ->
+      |> Enum.all?(fn {target_slave, actual_identity} ->
+        target_identity = get_device_identity(target_slave)
         devices_match?(target_identity, actual_identity)
       end)
     end
   end
+
+  # Extract device_identity from struct-based SlaveConfig
+  defp get_device_identity(%HardwareConfig.SlaveConfig{device_identity: device_identity}),
+    do: device_identity
+
+  # Extract device_identity from map-based config
+  defp get_device_identity(%{device_identity: device_identity}), do: device_identity
 
   defp devices_match?(target, actual) do
     target.vendor_id == actual.vendor_id and

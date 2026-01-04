@@ -51,7 +51,7 @@ defmodule HardwareConfigs do
             revision_no: nil,
             serial_no: nil
           },
-          driver: GenericDriver,
+          driver: EtherCAT.Slave.GenericDriver,
           config: %{
             sdos: [],
             sync_managers: [
@@ -90,7 +90,7 @@ defmodule HardwareConfigs do
             revision_no: nil,
             serial_no: nil
           },
-          driver: GenericDriver,
+          driver: EtherCAT.Slave.GenericDriver,
           config: %{
             sdos: [],
             sync_managers: [
