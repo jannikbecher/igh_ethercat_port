@@ -108,12 +108,15 @@ defmodule FakeEtherCAT do
     # Use ExUnit's start_supervised for proper cleanup
     {:ok, _pid} =
       ExUnit.Callbacks.start_supervised(
-        {EtherCAT.Master, [master_index: 1]},
-        id: :emulator_master
+        {EtherCAT.Master, [name: :emulator_master, master_index: 1]}
       )
 
     # Configure the emulator with inverted config
-    :ok = EtherCAT.Master.configure_hardware(inverted_config)
+    # May return :ok or {:ok, :config_stored} depending on state
+    case EtherCAT.Master.configure_hardware(:emulator_master, inverted_config) do
+      :ok -> :ok
+      {:ok, :config_stored} -> :ok
+    end
 
     {:ok, inverted_config}
   end
@@ -146,6 +149,7 @@ defmodule FakeEtherCAT do
     %{hardware_config | slaves: Enum.map(slaves, &invert_slave/1)}
   end
 
+  # Handle struct-based slave config
   defp invert_slave(%EtherCAT.HardwareConfig.SlaveConfig{} = slave) do
     # Invert sync managers in the config map
     inverted_config =
@@ -173,7 +177,38 @@ defmodule FakeEtherCAT do
     %{slave | config: inverted_config, registered_entries: inverted_registered_entries}
   end
 
-  defp invert_sync_manager(%EtherCAT.HardwareConfig.SyncManagerConfig{} = sync_manager) do
+  # Handle map-based slave config (for simple_hardware_config)
+  defp invert_slave(%{config: config, registered_entries: registered_entries} = slave) do
+    # Invert sync managers in the config map
+    inverted_config =
+      case Map.get(config, :sync_managers) do
+        nil ->
+          config
+
+        sync_managers ->
+          Map.put(config, :sync_managers, Enum.map(sync_managers, &invert_sync_manager_map/1))
+      end
+
+    # Invert registered_entries directions
+    inverted_registered_entries =
+      registered_entries
+      |> Enum.map(fn {domain_name, entries} ->
+        inverted_entries =
+          Enum.map(entries, fn {pdo_name, entry_name, deadband, interval_us} ->
+            {pdo_name, entry_name, deadband, interval_us}
+          end)
+
+        {domain_name, inverted_entries}
+      end)
+      |> Map.new()
+
+    %{slave | config: inverted_config, registered_entries: inverted_registered_entries}
+  end
+
+  # Handle struct-based sync manager
+  defp invert_sync_manager(
+         %EtherCAT.HardwareConfig.SlaveConfig.SyncManagerConfig{} = sync_manager
+       ) do
     inverted_pdos =
       sync_manager.pdos
       |> Enum.map(&invert_pdo/1)
@@ -181,7 +216,24 @@ defmodule FakeEtherCAT do
     %{sync_manager | direction: invert_direction(sync_manager.direction), pdos: inverted_pdos}
   end
 
-  defp invert_pdo(%EtherCAT.HardwareConfig.PdoConfig{} = pdo) do
+  # Handle map-based sync manager
+  defp invert_sync_manager_map(%{direction: direction, pdos: pdos} = sync_manager) do
+    inverted_pdos =
+      pdos
+      |> Enum.map(&invert_pdo_map/1)
+
+    %{sync_manager | direction: invert_direction(direction), pdos: inverted_pdos}
+  end
+
+  # Handle struct-based PDO
+  defp invert_pdo(%EtherCAT.HardwareConfig.SlaveConfig.PdoConfig{} = pdo) do
+    # PDO entries structure doesn't need direction inversion
+    # The direction is at the sync manager level
+    pdo
+  end
+
+  # Handle map-based PDO
+  defp invert_pdo_map(pdo) when is_map(pdo) do
     # PDO entries structure doesn't need direction inversion
     # The direction is at the sync manager level
     pdo

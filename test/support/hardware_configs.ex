@@ -23,7 +23,7 @@ defmodule HardwareConfigs do
 
   alias EtherCAT.HardwareConfig
 
-  def hardware_config do
+  def simple_hardware_config do
     %HardwareConfig{
       slaves: [
         # EK1100 - EtherCAT Coupler at position 0
