@@ -145,6 +145,9 @@ defmodule EtherCAT.Master do
 
   @impl true
   def init(opts) do
+    # Trap exits so linked driver processes don't crash the Master
+    Process.flag(:trap_exit, true)
+
     # Load driver
     priv_dir = :code.priv_dir(:ethercat) |> to_string()
 
@@ -211,10 +214,16 @@ defmodule EtherCAT.Master do
     }
 
     # Log preserved configuration for debugging
-    if old_state in [:operational, :synced] and data.target_slave_configs != [] do
-      Logger.info(
-        "EtherCAT Master: config preserved for #{length(data.target_slave_configs)} slaves, will auto-recover"
-      )
+    if old_state in [:operational, :synced] do
+      if data.target_slave_configs != [] do
+        Logger.info(
+          "EtherCAT Master: config preserved for #{length(data.target_slave_configs)} slaves, will auto-recover"
+        )
+      else
+        Logger.warning(
+          "EtherCAT Master: entering offline from #{old_state} but target_slave_configs is empty!"
+        )
+      end
     end
 
     # Start polling for link
@@ -285,6 +294,11 @@ defmodule EtherCAT.Master do
 
   def offline({:call, from}, _request, _data) do
     {:keep_state_and_data, [{:reply, from, {:error, :offline}}]}
+  end
+
+  def offline(:info, {:EXIT, _pid, _reason}, _data) do
+    # Ignore EXIT signals from terminated driver processes
+    :keep_state_and_data
   end
 
   def offline(:info, msg, data) do
@@ -413,6 +427,11 @@ defmodule EtherCAT.Master do
 
   def synced(:enter, _old_state, data) do
     Logger.info("EtherCAT Master: entering synced state, configuring slaves")
+
+    if data.target_slave_configs == [] do
+      Logger.error("EtherCAT Master: target_slave_configs is empty! Cannot configure slaves.")
+      raise "Cannot enter synced state without hardware configuration"
+    end
 
     # Configure each slave sequentially
     slaves =
@@ -762,7 +781,6 @@ defmodule EtherCAT.Master do
   defp terminate_all_drivers(slaves) do
     Enum.each(slaves, fn {_idx, slave_info} ->
       if slave_info.driver_pid && Process.alive?(slave_info.driver_pid) do
-        Logger.debug("Terminating driver for slave: #{slave_info.name}")
         GenServer.stop(slave_info.driver_pid, :shutdown, 5_000)
       end
     end)
