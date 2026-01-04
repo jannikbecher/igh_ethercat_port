@@ -22,19 +22,12 @@ defmodule SimpleHardwareConfig do
   """
 
   alias EtherCAT.HardwareConfig
-  alias EtherCAT.Slave.GenericDriver
-
-  alias EtherCAT.HardwareConfig.{
-    SlaveConfig,
-    SyncManagerConfig,
-    PdoConfig
-  }
 
   def hardware_config do
     %HardwareConfig{
       slaves: [
         # EK1100 - EtherCAT Coupler at position 0
-        %SlaveConfig{
+        %{
           name: :coupler,
           device_identity: %{
             vendor_id: 0x00000002,
@@ -50,7 +43,7 @@ defmodule SimpleHardwareConfig do
           registered_entries: %{}
         },
         # EL1809 - 16-channel digital input at position 1
-        %SlaveConfig{
+        %{
           name: :digital_inputs,
           device_identity: %{
             vendor_id: 0x00000002,
@@ -62,13 +55,13 @@ defmodule SimpleHardwareConfig do
           config: %{
             sdos: [],
             sync_managers: [
-              %SyncManagerConfig{
+              %{
                 index: 3,
                 direction: :input,
                 watchdog: :disabled,
                 pdos:
                   for ch <- 1..16 do
-                    %PdoConfig{
+                    %{
                       index: 0x1A00 + (ch - 1),
                       name: :"channel_#{ch}",
                       entries: %{
@@ -89,7 +82,7 @@ defmodule SimpleHardwareConfig do
           }
         },
         # EL2809 - 16-channel digital output at position 2
-        %SlaveConfig{
+        %{
           name: :digital_outputs,
           device_identity: %{
             vendor_id: 0x00000002,
@@ -102,13 +95,13 @@ defmodule SimpleHardwareConfig do
             sdos: [],
             sync_managers: [
               # First 8 channels in SM0
-              %SyncManagerConfig{
+              %{
                 index: 0,
                 direction: :output,
                 watchdog: :enabled,
                 pdos:
                   for ch <- 1..8 do
-                    %PdoConfig{
+                    %{
                       index: 0x1600 + (ch - 1),
                       name: :"channel_#{ch}",
                       entries: %{
@@ -118,13 +111,13 @@ defmodule SimpleHardwareConfig do
                   end
               },
               # Second 8 channels in SM1
-              %SyncManagerConfig{
+              %{
                 index: 1,
                 direction: :output,
                 watchdog: :enabled,
                 pdos:
                   for ch <- 9..16 do
-                    %PdoConfig{
+                    %{
                       index: 0x1600 + (ch - 1),
                       name: :"channel_#{ch}",
                       entries: %{
